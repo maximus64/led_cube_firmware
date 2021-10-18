@@ -1,0 +1,3 @@
+[submodule "matrixserver"]
+	path = matrixserver
+	url = https://github.com/squarewavedot/matrixserver.git
