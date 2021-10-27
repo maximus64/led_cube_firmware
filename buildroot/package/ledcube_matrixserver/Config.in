@@ -1,0 +1,7 @@
+config BR2_PACKAGE_LEDCUBE_MATRIXSERVER
+	bool "led cube matrixserver"
+	select BR2_PACKAGE_PROTOBUF
+	help
+	  SquareWave LEDCube MatrixServer
+
+	  https://github.com/squarewavedot/matrixserver
