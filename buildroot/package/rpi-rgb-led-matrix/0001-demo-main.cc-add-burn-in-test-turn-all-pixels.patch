@@ -1,0 +1,59 @@
+From f0dab0810b0f15049bce24c4a4ca464e143cea35 Mon Sep 17 00:00:00 2001
+From: Khoa Hoang <admin@khoahoang.com>
+Date: Sat, 6 Nov 2021 14:24:42 -0700
+Subject: [PATCH] demo-main.cc: add burn in test turn all pixels
+
+Add demo #12 burn in test that turn all pixels to white
+
+Signed-off-by: Khoa Hoang <admin@khoahoang.com>
+---
+ examples-api-use/demo-main.cc | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/examples-api-use/demo-main.cc b/examples-api-use/demo-main.cc
+index a055dfe..42625e8 100644
+--- a/examples-api-use/demo-main.cc
++++ b/examples-api-use/demo-main.cc
+@@ -1026,6 +1026,18 @@ private:
+   citizen* parents_;
+ };
+ 
++
++class BurnInTest : public DemoRunner {
++public:
++  BurnInTest(Canvas *m) : DemoRunner(m) {}
++  void Run() override {
++    canvas()->Fill(255, 255, 255);
++
++    while (!interrupt_received)
++      sleep(1);
++  }
++};
++
+ static int usage(const char *progname) {
+   fprintf(stderr, "usage: %s <options> -D <demo-nr> [optional parameter]\n",
+           progname);
+@@ -1049,7 +1061,8 @@ static int usage(const char *progname) {
+           "\t8  - Langton's ant (-m <time-step-ms>)\n"
+           "\t9  - Volume bars (-m <time-step-ms>)\n"
+           "\t10 - Evolution of color (-m <time-step-ms>)\n"
+-          "\t11 - Brightness pulse generator\n");
++          "\t11 - Brightness pulse generator\n"
++          "\t12 - Burn in test: all white\n");
+   fprintf(stderr, "Example:\n\t%s -D 1 runtext.ppm\n"
+           "Scrolls the runtext until Ctrl-C is pressed\n", progname);
+   return 1;
+@@ -1166,6 +1179,10 @@ int main(int argc, char *argv[]) {
+   case 11:
+     demo_runner = new BrightnessPulseGenerator(matrix);
+     break;
++
++  case 12:
++    demo_runner = new BurnInTest(matrix);
++    break;
+   }
+ 
+   if (demo_runner == NULL)
+-- 
+2.33.1
+
