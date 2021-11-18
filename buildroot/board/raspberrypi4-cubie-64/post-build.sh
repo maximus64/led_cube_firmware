@@ -14,3 +14,4 @@ fi
 
 install -m 0644 -D ${BOARD_DIR}/config.txt ${BINARIES_DIR}/rpi-firmware/config.txt
 install -m 0644 -D ${BOARD_DIR}/cmdline.txt ${BINARIES_DIR}/rpi-firmware/cmdline.txt
+install -m 0644 -D ${BINARIES_DIR}/bcm2711-rpi-4-b-led-cube.dtb ${BINARIES_DIR}/bcm2711-rpi-4-b.dtb
