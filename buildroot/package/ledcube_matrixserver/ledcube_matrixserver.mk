@@ -5,7 +5,7 @@
 ################################################################################
 
 LEDCUBE_MATRIXSERVER_VERSION = 0.1
-LEDCUBE_MATRIXSERVER_SITE = /work/port/matrixserver
+LEDCUBE_MATRIXSERVER_SITE = $(TOPDIR)/../matrixserver
 LEDCUBE_MATRIXSERVER_SITE_METHOD = local
 LEDCUBE_MATRIXSERVER_DEPENDENCIES = boost protobuf eigen imlib2
 LEDCUBE_MATRIXSERVER_LICENSE = GPL-3
