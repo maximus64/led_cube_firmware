@@ -1,6 +1,6 @@
 [submodule "matrixserver"]
 	path = matrixserver
-	url = https://github.com/squarewavedot/matrixserver.git
+	url = git@github.com:maximus64/matrixserver.git
 [submodule "linux"]
 	path = linux
 	url = git@github.com:maximus64/raspberrypi-linux.git
