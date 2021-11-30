@@ -1,0 +1,7 @@
+config BR2_PACKAGE_LEDCUBE_EXAMPLEAPPLICATIONS
+	bool "led cube example applications"
+	select BR2_PACKAGE_LEDCUBE_MATRIXSERVER
+	help
+	  SquareWave LEDCube Example Applications
+
+	  https://github.com/squarewavedot/exampleApplications
