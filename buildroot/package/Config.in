@@ -2513,6 +2513,7 @@ endmenu
 
 menu "LED Cube"
 	source "package/ledcube_matrixserver/Config.in"
+	source "package/ledcube_exampleapplications/Config.in"
 	source "package/rpi-rgb-led-matrix/Config.in"
 endmenu
 

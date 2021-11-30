@@ -4,3 +4,6 @@
 [submodule "linux"]
 	path = linux
 	url = git@github.com:maximus64/raspberrypi-linux.git
+[submodule "exampleApplications"]
+	path = exampleApplications
+	url = git@github.com:maximus64/exampleApplications.git
