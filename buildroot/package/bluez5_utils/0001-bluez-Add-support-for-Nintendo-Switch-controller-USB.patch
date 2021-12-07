@@ -1,0 +1,484 @@
+From acc088ac13ae7215d436ae6cf8c9d62be5114b99 Mon Sep 17 00:00:00 2001
+From: Khoa Hoang <admin@khoahoang.com>
+Date: Mon, 6 Dec 2021 23:22:58 -0800
+Subject: [PATCH 1/2] bluez: Add support for Nintendo Switch controller USB
+ pairing
+
+Signed-off-by: Khoa Hoang <admin@khoahoang.com>
+---
+ Makefile.plugins   |   4 +
+ plugins/nintendo.c | 335 +++++++++++++++++++++++++++++++++++++++++++++
+ src/adapter.c      |  58 +++++++-
+ src/adapter.h      |   4 +
+ 4 files changed, 397 insertions(+), 4 deletions(-)
+ create mode 100644 plugins/nintendo.c
+
+diff --git a/Makefile.plugins b/Makefile.plugins
+index 69fb010..dd4190e 100644
+--- a/Makefile.plugins
++++ b/Makefile.plugins
+@@ -116,3 +116,7 @@ plugins_sixaxis_la_LDFLAGS = $(AM_LDFLAGS) -module -avoid-version
+ plugins_sixaxis_la_LIBADD = $(UDEV_LIBS)
+ plugins_sixaxis_la_CFLAGS = $(AM_CFLAGS) -fvisibility=hidden
+ endif
++
++builtin_modules += nintendo
++builtin_sources += plugins/nintendo.c
++builtin_ldadd += $(UDEV_LIBS)
+diff --git a/plugins/nintendo.c b/plugins/nintendo.c
+new file mode 100644
+index 0000000..7da7431
+--- /dev/null
++++ b/plugins/nintendo.c
+@@ -0,0 +1,335 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ *
++ *  BlueZ - Bluetooth protocol stack for Linux
++ *
++ *  Copyright (C) 2009  Bastien Nocera <hadess@hadess.net>
++ *  Copyright (C) 2011  Antonio Ospite <ospite@studenti.unina.it>
++ *  Copyright (C) 2013  Szymon Janc <szymon.janc@gmail.com>
++ *  Copyright (C) 2021  Khoa Hoang <admin@khoahoang.com>
++ *
++ *
++ */
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#define _GNU_SOURCE
++#include <stddef.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <stdlib.h>
++#include <sys/ioctl.h>
++#include <linux/hidraw.h>
++#include <linux/input.h>
++#include <glib.h>
++#include <libudev.h>
++
++#include "lib/bluetooth.h"
++#include "lib/sdp.h"
++#include "lib/uuid.h"
++
++#include "src/adapter.h"
++#include "src/device.h"
++#include "src/agent.h"
++#include "src/plugin.h"
++#include "src/log.h"
++#include "src/shared/util.h"
++
++struct device_info {
++	const char *name;
++	uint16_t source;
++	uint16_t vid;
++	uint16_t pid;
++	uint16_t version;
++};
++
++static const struct device_info devices_list[] = {
++	{
++		.name = "Pro Controller",
++		.source = 0x0002,
++		.vid = 0x057e,
++		.pid = 0x2009,
++		.version = 0x0001,
++	},
++	{}
++};
++
++static struct udev *ctx = NULL;
++static struct udev_monitor *monitor = NULL;
++static guint watch_id = 0;
++
++#define PRO_CTLR_HID_SDP_RECORD "36017D0900000A00010000090001350319"\
++	"1124090004350D350619010009001135031900110900053503191002090006350909656"\
++	"E09006A0901000900093508350619112409010109000D350F350D350619010009001335"\
++	"031900110901002510576972656C6573732047616D65706164090101250747616D65706"\
++	"16409010225084E696E74656E646F090201090111090202080809020308210902042801"\
++	"090205280109020635B035AE082225AA05010905A1010601FF852109217508953081028"\
++	"53009307508953081028531093175089669018102853209327508966901810285330933"\
++	"75089669018102853F05091901291015002501750195108102050109391500250775049"\
++	"501814205097504950181010501093009310933093416000027FFFF0000751095048102"\
++	"0601FF85010901750895309102851009107508953091028511091175089530910285120"\
++	"912750895309102C009020735083506090409090100090209280109020A280109020C09"\
++	"0C8009020D280009020E2800"
++
++static int str2buf(const char *str, uint8_t *buf, size_t blen)
++{
++	int i, dlen;
++
++	if (str == NULL)
++		return -EINVAL;
++
++	memset(buf, 0, blen);
++
++	dlen = MIN((strlen(str) / 2), blen);
++
++	for (i = 0; i < dlen; i++)
++		sscanf(str + (i * 2), "%02hhX", &buf[i]);
++
++	return 0;
++}
++
++static int get_device_bdaddr(const char *sysfs_path, bdaddr_t *bdaddr)
++{
++	char path[256] = {0};
++	uint8_t buf[17+1] = {0};
++	int ret;
++	int fd;
++
++	snprintf(path, sizeof(path), "%s/bt_mac", sysfs_path);
++
++	fd = open(path, O_RDONLY);
++	if (fd < 0) {
++		error("nintendo: failed to open sysfs bt_mac (%s)",
++							strerror(errno));
++		return -1;
++	}
++
++	ret = read(fd, buf, 17);
++	if (ret < 0) {
++		error("nintendo: failed to read device address (%s)",
++		      strerror(errno));
++		return -2;
++	}
++	DBG("device mac: %s", buf);
++	str2ba(buf, bdaddr);
++
++	return 0;
++}
++
++static int pair_central_bdaddr(const char *sysfs_path, const bdaddr_t *bdaddr, uint8_t* link_key)
++{
++	char path[256] = {0};
++	uint8_t buf[32+1] = {0};
++	char adapter_addr[18];
++	int ret;
++	int fd;
++
++	snprintf(path, sizeof(path), "%s/bt_pair", sysfs_path);
++
++	fd = open(path, O_RDWR);
++	if (fd < 0) {
++		error("nintendo: failed to open sysfs bt_pair (%s)",
++							strerror(errno));
++		return -1;
++	}
++
++	ba2str(bdaddr, adapter_addr);
++	ret = write(fd, adapter_addr, 17);
++	if (ret < 0) {
++		error("nintendo: failed to write adapter address to bt_pair(%s)",
++		      strerror(errno));
++		return -2;
++	}
++
++	lseek(fd, 0, SEEK_SET);
++
++	ret = read(fd, buf, 32);
++	if (ret < 0) {
++		error("nintendo: failed to read device link key (%s)",
++		      strerror(errno));
++		return -3;
++	}
++
++	str2buf(buf, link_key, 16);
++
++	return 0;
++}
++
++static void setup_device(const char *sysfs_path,
++			struct btd_adapter *adapter,
++			const struct device_info *di)
++{
++	int ret;
++	bdaddr_t device_bdaddr;
++	const bdaddr_t *adapter_bdaddr;
++	struct btd_device *device;
++	uint8_t key[16] = {0};
++	char adapter_addr[18];
++
++	if (get_device_bdaddr(sysfs_path, &device_bdaddr) < 0)
++		return;
++
++	/* check if controller already paired before */
++	device = btd_adapter_find_device(adapter, &device_bdaddr,
++							BDADDR_BREDR);
++	if (device != NULL &&
++		btd_device_is_connected(device) &&
++		g_slist_find_custom(btd_device_get_uuids(device), HID_UUID,
++						(GCompareFunc)strcasecmp)) {
++		char device_addr[18];
++		ba2str(&device_bdaddr, device_addr);
++		DBG("device %s already known, skipping", device_addr);
++		return;
++	}
++
++	device = btd_adapter_get_device(adapter, &device_bdaddr, BDADDR_BREDR);
++
++	info("nintendo: setting up new device");
++
++	btd_device_device_set_name(device, di->name);
++	btd_device_set_pnpid(device, di->source, di->vid, di->pid, di->version);
++
++	adapter_bdaddr = btd_adapter_get_address(adapter);
++	ba2str(adapter_bdaddr, adapter_addr);
++	DBG("adapter_addr %s", adapter_addr);
++
++	ret = pair_central_bdaddr(sysfs_path, adapter_bdaddr, key);
++	if (ret < 0) {
++		DBG("fail to pair device. ret=%d", ret);
++		goto err;
++	}
++
++	adapter_update_link_key(device, key, 4, 0);
++
++	btd_device_set_trusted(device, true);
++	btd_device_set_temporary(device, false);
++
++	btd_device_set_record(device, HID_UUID,
++			PRO_CTLR_HID_SDP_RECORD);
++
++	return;
++err:
++	btd_adapter_remove_device(adapter, device);
++}
++
++static const struct device_info *look_up_device(struct udev_device *udevice, uint16_t *bus,
++						char **sysfs_path)
++{
++	const char *hid_name;
++	const char *hid_id;
++	const struct device_info *di;
++	uint16_t vid, pid;
++
++	hid_id = udev_device_get_property_value(udevice, "HID_ID");
++
++	if (!hid_id || sscanf(hid_id, "%hx:%hx:%hx", bus, &vid, &pid) != 3)
++		return NULL;
++
++	hid_name = udev_device_get_property_value(udevice, "HID_NAME");
++
++	for (di = &devices_list[0]; di->name != NULL; di++) {
++		if (di->vid == vid && di->pid == pid)
++			break;
++	}
++
++	if (di->name == NULL)
++		return NULL;
++
++	*sysfs_path = g_strdup(udev_device_get_syspath(udevice));
++	return di;
++}
++
++static void device_added(struct udev_device *udevice)
++{
++	struct btd_adapter *adapter;
++	uint16_t bus;
++	char *sysfs_path = NULL;
++	const struct device_info *di;
++
++	DBG("");
++
++	adapter = btd_adapter_get_default();
++	if (!adapter)
++		return;
++
++	if (!(di = look_up_device(udevice, &bus, &sysfs_path)))
++		return;
++	if (bus != BUS_USB)
++		return;
++
++	info("nintendo: compatible device connected");
++
++	setup_device(sysfs_path, adapter, di);
++
++	g_free(sysfs_path);
++}
++
++
++static gboolean monitor_watch(GIOChannel *source, GIOCondition condition,
++							gpointer data)
++{
++	struct udev_device *udevice;
++
++	udevice = udev_monitor_receive_device(monitor);
++	if (!udevice)
++		return TRUE;
++
++	if (!g_strcmp0(udev_device_get_action(udevice), "add"))
++		device_added(udevice);
++
++	udev_device_unref(udevice);
++
++	return TRUE;
++}
++
++static int nintendo_init(void)
++{
++	GIOChannel *channel;
++
++	DBG("");
++
++	ctx = udev_new();
++	if (!ctx)
++		return -EIO;
++
++	monitor = udev_monitor_new_from_netlink(ctx, "udev");
++	if (!monitor) {
++		udev_unref(ctx);
++		ctx = NULL;
++
++		return -EIO;
++	}
++
++	/* Listen for newly connected hid interfaces */
++	udev_monitor_filter_add_match_subsystem_devtype(monitor, "hid",
++			NULL);
++	udev_monitor_enable_receiving(monitor);
++
++	channel = g_io_channel_unix_new(udev_monitor_get_fd(monitor));
++	watch_id = g_io_add_watch(channel, G_IO_IN, monitor_watch, NULL);
++	g_io_channel_unref(channel);
++
++	return 0;
++}
++
++static void nintendo_exit(void)
++{
++	gpointer value;
++
++	DBG("");
++
++	g_source_remove(watch_id);
++	watch_id = 0;
++
++	udev_monitor_unref(monitor);
++	monitor = NULL;
++
++	udev_unref(ctx);
++	ctx = NULL;
++}
++
++BLUETOOTH_PLUGIN_DEFINE(nintendo, VERSION, BLUETOOTH_PLUGIN_PRIORITY_LOW,
++						nintendo_init, nintendo_exit)
+diff --git a/src/adapter.c b/src/adapter.c
+index 5846f03..0e24c1f 100644
+--- a/src/adapter.c
++++ b/src/adapter.c
+@@ -310,6 +310,8 @@ struct btd_adapter {
+ 	GSList *drivers;
+ 	GSList *profiles;
+ 
++	GSList *link_keys;
++
+ 	struct oob_handler *oob_handler;
+ 
+ 	unsigned int load_ltks_id;
+@@ -4659,7 +4661,6 @@ done:
+ static void load_devices(struct btd_adapter *adapter)
+ {
+ 	char dirname[PATH_MAX];
+-	GSList *keys = NULL;
+ 	GSList *ltks = NULL;
+ 	GSList *irks = NULL;
+ 	GSList *params = NULL;
+@@ -4745,7 +4746,7 @@ static void load_devices(struct btd_adapter *adapter)
+ 		}
+ 
+ 		if (key_info)
+-			keys = g_slist_append(keys, key_info);
++			adapter->link_keys = g_slist_append(adapter->link_keys, key_info);
+ 
+ 		if (ltk_info)
+ 			ltks = g_slist_append(ltks, ltk_info);
+@@ -4791,8 +4792,7 @@ free:
+ 
+ 	closedir(dir);
+ 
+-	load_link_keys(adapter, keys, btd_opts.debug_keys);
+-	g_slist_free_full(keys, g_free);
++	load_link_keys(adapter, adapter->link_keys, btd_opts.debug_keys);
+ 
+ 	load_ltks(adapter, ltks);
+ 	g_slist_free_full(ltks, g_free);
+@@ -5652,6 +5652,9 @@ static void adapter_free(gpointer user_data)
+ 	if (adapter->allowed_uuid_set)
+ 		g_hash_table_destroy(adapter->allowed_uuid_set);
+ 
++	if (adapter->link_keys)
++		g_slist_free_full(adapter->link_keys, g_free);
++
+ 	g_free(adapter);
+ }
+ 
+@@ -10351,3 +10354,50 @@ bool btd_has_kernel_features(uint32_t features)
+ {
+ 	return (kernel_features & features) ? true : false;
+ }
++
++void adapter_update_link_key(struct btd_device *device,
++						const uint8_t* link_key, uint8_t type,
++						uint8_t pin_length)
++{
++	struct btd_adapter *adapter = device_get_adapter(device);
++	struct link_key_info *info = NULL;
++	GSList *l;
++	const bdaddr_t *bdaddr = device_get_address(device);
++	char dev_addr[18];
++
++	ba2str(bdaddr, dev_addr);
++
++	DBG("update link key for: %s", dev_addr);
++
++	/* update existing key if found */
++	for (l = adapter->link_keys; l != NULL; l = g_slist_next(l)) {
++		info = l->data;
++		if (!bacmp(&info->bdaddr, bdaddr)) {
++			DBG("update existing link key");
++			memcpy(info->key, link_key, 16);
++			info->type = type;
++			info->pin_len = pin_length;
++			info->is_blocked = 0;
++			break;
++		}
++	}
++
++	/* create new key */
++	if (l == NULL) {
++		DBG("create new link key entry");
++		info = g_new0(struct link_key_info, 1);
++		info->bdaddr = *device_get_address(device);
++		memcpy(info->key, link_key, sizeof(info->key));
++		info->type = type;
++		info->pin_len = pin_length;
++		info->is_blocked = 0;
++		adapter->link_keys = g_slist_append(adapter->link_keys, info);
++	}
++
++	store_link_key(adapter, device, info->key, type, pin_length);
++
++	device_set_paired(device, BDADDR_BREDR);
++	device_set_bonded(device, BDADDR_BREDR);
++
++	load_link_keys(adapter, adapter->link_keys, false);
++}
+diff --git a/src/adapter.h b/src/adapter.h
+index db3c17f..2ac9bcd 100644
+--- a/src/adapter.h
++++ b/src/adapter.h
+@@ -256,3 +256,7 @@ bool btd_adapter_set_allowed_uuids(struct btd_adapter *adapter,
+ 							struct queue *uuids);
+ bool btd_adapter_is_uuid_allowed(struct btd_adapter *adapter,
+ 							const char *uuid_str);
++
++void adapter_update_link_key(struct btd_device *device,
++						const uint8_t* link_key, uint8_t type,
++						uint8_t pin_length);
+-- 
+2.33.1
+
