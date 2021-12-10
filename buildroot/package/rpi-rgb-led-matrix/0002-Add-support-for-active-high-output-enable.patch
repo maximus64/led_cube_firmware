@@ -1,0 +1,623 @@
+From 3c79acb127222e631fd88d5f1d5995b9b755fa5e Mon Sep 17 00:00:00 2001
+From: Khoa Hoang <admin@khoahoang.com>
+Date: Thu, 9 Dec 2021 20:19:40 -0800
+Subject: [PATCH 2/3] Add support for active high output enable
+
+This change added support for active high output signal for OE. Polarity of OE is
+control by output_polarity field in HardwareMapping.
+
+Signed-off-by: Khoa Hoang <admin@khoahoang.com>
+---
+ lib/framebuffer.cc     |   1 +
+ lib/gpio-bits.h        |   6 +
+ lib/gpio.cc            |  37 +++--
+ lib/gpio.h             |   1 +
+ lib/hardware-mapping.c | 347 +++++++++++++++++++++--------------------
+ lib/hardware-mapping.h |   1 +
+ 6 files changed, 213 insertions(+), 180 deletions(-)
+
+diff --git a/lib/framebuffer.cc b/lib/framebuffer.cc
+index ab73e62..5a221ec 100644
+--- a/lib/framebuffer.cc
++++ b/lib/framebuffer.cc
+@@ -460,6 +460,7 @@ Framebuffer::~Framebuffer() {
+     if (b >= dither_bits) timing_ns *= 2;
+   }
+   sOutputEnablePulser = PinPulser::Create(io, h.output_enable,
++                                          h.output_polarity,
+                                           allow_hardware_pulsing,
+                                           bitplane_timings);
+ }
+diff --git a/lib/gpio-bits.h b/lib/gpio-bits.h
+index de9c7c8..146a068 100644
+--- a/lib/gpio-bits.h
++++ b/lib/gpio-bits.h
+@@ -25,4 +25,10 @@ typedef uint64_t gpio_bits_t;
+ typedef uint32_t gpio_bits_t;
+ #endif
+ 
++typedef enum
++{
++    GPIO_ACTIVE_LOW = 0,
++    GPIO_ACTIVE_HIGH = 1,
++} gpio_active_t;
++
+ #endif
+diff --git a/lib/gpio.cc b/lib/gpio.cc
+index 0861482..fe3c35f 100644
+--- a/lib/gpio.cc
++++ b/lib/gpio.cc
+@@ -410,8 +410,9 @@ public:
+ class TimerBasedPinPulser : public PinPulser {
+ public:
+   TimerBasedPinPulser(GPIO *io, gpio_bits_t bits,
++                      gpio_active_t polarity,
+                       const std::vector<int> &nano_specs)
+-    : io_(io), bits_(bits), nano_specs_(nano_specs) {
++    : io_(io), bits_(bits), polarity_(polarity), nano_specs_(nano_specs) {
+     if (!s_Timer1Mhz) {
+       fprintf(stderr, "FYI: not running as root which means we can't properly "
+               "control timing unless this is a real-time kernel. Expect color "
+@@ -420,14 +421,22 @@ public:
+   }
+ 
+   virtual void SendPulse(int time_spec_number) {
+-    io_->ClearBits(bits_);
+-    Timers::sleep_nanos(nano_specs_[time_spec_number]);
+-    io_->SetBits(bits_);
++    if (polarity_ == GPIO_ACTIVE_HIGH) {
++      io_->SetBits(bits_);
++      Timers::sleep_nanos(nano_specs_[time_spec_number]);
++      io_->ClearBits(bits_);
++    }
++    else {
++      io_->ClearBits(bits_);
++      Timers::sleep_nanos(nano_specs_[time_spec_number]);
++      io_->SetBits(bits_);
++    }
+   }
+ 
+ private:
+   GPIO *const io_;
+   const gpio_bits_t bits_;
++  const gpio_active_t polarity_;
+   const std::vector<int> nano_specs_;
+ };
+ 
+@@ -622,7 +631,8 @@ public:
+ #endif
+   }
+ 
+-  HardwarePinPulser(gpio_bits_t pins, const std::vector<int> &specs)
++  HardwarePinPulser(gpio_bits_t pins, gpio_active_t polarity,
++                    const std::vector<int> &specs)
+     : triggered_(false) {
+     assert(CanHandle(pins));
+     assert(s_CLK_registers && s_PWM_registers && s_Timer1Mhz);
+@@ -644,6 +654,11 @@ public:
+       exit(1);
+     }
+ 
++    if (polarity == GPIO_ACTIVE_HIGH)
++      pwm_polarity_ = 0;
++    else
++      pwm_polarity_ = PWM_CTL_POLA1;
++
+     for (size_t i = 0; i < specs.size(); ++i) {
+       // Hints how long to nanosleep, already corrected for system overhead.
+       sleep_hints_us_.push_back(specs[i]/1000 - JitterAllowanceMicroseconds());
+@@ -710,7 +725,7 @@ public:
+     sleep_hint_us_ = sleep_hints_us_[c];
+     start_time_ = *s_Timer1Mhz;
+     triggered_ = true;
+-    s_PWM_registers[PWM_CTL] = PWM_CTL_USEF1 | PWM_CTL_PWEN1 | PWM_CTL_POLA1;
++    s_PWM_registers[PWM_CTL] = PWM_CTL_USEF1 | PWM_CTL_PWEN1 | pwm_polarity_;
+   }
+ 
+   virtual void WaitPulseFinished() {
+@@ -747,7 +762,7 @@ public:
+     while ((s_PWM_registers[PWM_STA] & PWM_STA_EMPT1) == 0) {
+       // busy wait until done.
+     }
+-    s_PWM_registers[PWM_CTL] = PWM_CTL_USEF1 | PWM_CTL_POLA1 | PWM_CTL_CLRF1;
++    s_PWM_registers[PWM_CTL] = PWM_CTL_USEF1 | pwm_polarity_ | PWM_CTL_CLRF1;
+     triggered_ = false;
+   }
+ 
+@@ -761,7 +776,7 @@ private:
+   void InitPWMDivider(uint32_t divider) {
+     assert(divider < (1<<12));  // we only have 12 bits.
+ 
+-    s_PWM_registers[PWM_CTL] = PWM_CTL_USEF1 | PWM_CTL_POLA1 | PWM_CTL_CLRF1;
++    s_PWM_registers[PWM_CTL] = PWM_CTL_USEF1 | pwm_polarity_ | PWM_CTL_CLRF1;
+ 
+     // reset PWM clock
+     s_CLK_registers[CLK_PWMCTL] = CLK_PASSWD | CLK_CTL_KILL;
+@@ -785,19 +800,21 @@ private:
+   uint32_t start_time_;
+   int sleep_hint_us_;
+   bool triggered_;
++  uint32_t pwm_polarity_;
+ };
+ 
+ } // end anonymous namespace
+ 
+ // Public PinPulser factory
+ PinPulser *PinPulser::Create(GPIO *io, gpio_bits_t gpio_mask,
++                             gpio_active_t polarity,
+                              bool allow_hardware_pulsing,
+                              const std::vector<int> &nano_wait_spec) {
+   if (!Timers::Init()) return NULL;
+   if (allow_hardware_pulsing && HardwarePinPulser::CanHandle(gpio_mask)) {
+-    return new HardwarePinPulser(gpio_mask, nano_wait_spec);
++    return new HardwarePinPulser(gpio_mask, polarity, nano_wait_spec);
+   } else {
+-    return new TimerBasedPinPulser(io, gpio_mask, nano_wait_spec);
++    return new TimerBasedPinPulser(io, gpio_mask, polarity, nano_wait_spec);
+   }
+ }
+ 
+diff --git a/lib/gpio.h b/lib/gpio.h
+index 2114b18..5cc7f52 100644
+--- a/lib/gpio.h
++++ b/lib/gpio.h
+@@ -128,6 +128,7 @@ public:
+   // "nano_wait_spec" contains a list of time periods we'd like
+   //   invoke later. This can be used to pre-process timings if needed.
+   static PinPulser *Create(GPIO *io, gpio_bits_t gpio_mask,
++                           gpio_active_t polarity,
+                            bool allow_hardware_pulsing,
+                            const std::vector<int> &nano_wait_spec);
+ 
+diff --git a/lib/hardware-mapping.c b/lib/hardware-mapping.c
+index 758b428..843f77d 100644
+--- a/lib/hardware-mapping.c
++++ b/lib/hardware-mapping.c
+@@ -27,91 +27,94 @@ struct HardwareMapping matrix_hardware_mappings[] = {
+    * by the adapter PCBs.
+    */
+   {
+-    .name          = "regular",
++    .name            = "regular",
+ 
+-    .output_enable = GPIO_BIT(18),
+-    .clock         = GPIO_BIT(17),
+-    .strobe        = GPIO_BIT(4),
++    .output_enable   = GPIO_BIT(18),
++    .output_polarity = GPIO_ACTIVE_LOW,
++    .clock           = GPIO_BIT(17),
++    .strobe          = GPIO_BIT(4),
+ 
+     /* Address lines */
+-    .a             = GPIO_BIT(22),
+-    .b             = GPIO_BIT(23),
+-    .c             = GPIO_BIT(24),
+-    .d             = GPIO_BIT(25),
+-    .e             = GPIO_BIT(15),  /* RxD kept free unless 1:64 */
++    .a               = GPIO_BIT(22),
++    .b               = GPIO_BIT(23),
++    .c               = GPIO_BIT(24),
++    .d               = GPIO_BIT(25),
++    .e               = GPIO_BIT(15),  /* RxD kept free unless 1:64 */
+ 
+     /* Parallel chain 0, RGB for both sub-panels */
+-    .p0_r1         = GPIO_BIT(11),  /* masks: SPI0_SCKL  */
+-    .p0_g1         = GPIO_BIT(27),  /* Not on RPi1, Rev1; use "regular-pi1" instead */
+-    .p0_b1         = GPIO_BIT(7),   /* masks: SPI0_CE1   */
+-    .p0_r2         = GPIO_BIT(8),   /* masks: SPI0_CE0   */
+-    .p0_g2         = GPIO_BIT(9),   /* masks: SPI0_MISO  */
+-    .p0_b2         = GPIO_BIT(10),  /* masks: SPI0_MOSI  */
++    .p0_r1           = GPIO_BIT(11),  /* masks: SPI0_SCKL  */
++    .p0_g1           = GPIO_BIT(27),  /* Not on RPi1, Rev1; use "regular-pi1" instead */
++    .p0_b1           = GPIO_BIT(7),   /* masks: SPI0_CE1   */
++    .p0_r2           = GPIO_BIT(8),   /* masks: SPI0_CE0   */
++    .p0_g2           = GPIO_BIT(9),   /* masks: SPI0_MISO  */
++    .p0_b2           = GPIO_BIT(10),  /* masks: SPI0_MOSI  */
+ 
+     /* All the following are only available with 40 GPIP pins, on A+/B+/Pi2,3 */
+     /* Chain 1 */
+-    .p1_r1         = GPIO_BIT(12),
+-    .p1_g1         = GPIO_BIT(5),
+-    .p1_b1         = GPIO_BIT(6),
+-    .p1_r2         = GPIO_BIT(19),
+-    .p1_g2         = GPIO_BIT(13),
+-    .p1_b2         = GPIO_BIT(20),
++    .p1_r1           = GPIO_BIT(12),
++    .p1_g1           = GPIO_BIT(5),
++    .p1_b1           = GPIO_BIT(6),
++    .p1_r2           = GPIO_BIT(19),
++    .p1_g2           = GPIO_BIT(13),
++    .p1_b2           = GPIO_BIT(20),
+ 
+     /* Chain 2 */
+-    .p2_r1         = GPIO_BIT(14), /* masks TxD when parallel=3 */
+-    .p2_g1         = GPIO_BIT(2),  /* masks SCL when parallel=3 */
+-    .p2_b1         = GPIO_BIT(3),  /* masks SDA when parallel=3 */
+-    .p2_r2         = GPIO_BIT(26),
+-    .p2_g2         = GPIO_BIT(16),
+-    .p2_b2         = GPIO_BIT(21),
++    .p2_r1           = GPIO_BIT(14), /* masks TxD when parallel=3 */
++    .p2_g1           = GPIO_BIT(2),  /* masks SCL when parallel=3 */
++    .p2_b1           = GPIO_BIT(3),  /* masks SDA when parallel=3 */
++    .p2_r2           = GPIO_BIT(26),
++    .p2_g2           = GPIO_BIT(16),
++    .p2_b2           = GPIO_BIT(21),
+   },
+ 
+   /*
+    * This is used if you have an Adafruit HAT in the default configuration
+    */
+   {
+-    .name          = "adafruit-hat",
+-
+-    .output_enable = GPIO_BIT(4),
+-    .clock         = GPIO_BIT(17),
+-    .strobe        = GPIO_BIT(21),
+-
+-    .a             = GPIO_BIT(22),
+-    .b             = GPIO_BIT(26),
+-    .c             = GPIO_BIT(27),
+-    .d             = GPIO_BIT(20),
+-    .e             = GPIO_BIT(24),  /* Needs manual wiring, see README.md */
+-
+-    .p0_r1         = GPIO_BIT(5),
+-    .p0_g1         = GPIO_BIT(13),
+-    .p0_b1         = GPIO_BIT(6),
+-    .p0_r2         = GPIO_BIT(12),
+-    .p0_g2         = GPIO_BIT(16),
+-    .p0_b2         = GPIO_BIT(23),
++    .name            = "adafruit-hat",
++
++    .output_enable   = GPIO_BIT(4),
++    .output_polarity = GPIO_ACTIVE_LOW,
++    .clock           = GPIO_BIT(17),
++    .strobe          = GPIO_BIT(21),
++
++    .a               = GPIO_BIT(22),
++    .b               = GPIO_BIT(26),
++    .c               = GPIO_BIT(27),
++    .d               = GPIO_BIT(20),
++    .e               = GPIO_BIT(24),  /* Needs manual wiring, see README.md */
++
++    .p0_r1           = GPIO_BIT(5),
++    .p0_g1           = GPIO_BIT(13),
++    .p0_b1           = GPIO_BIT(6),
++    .p0_r2           = GPIO_BIT(12),
++    .p0_g2           = GPIO_BIT(16),
++    .p0_b2           = GPIO_BIT(23),
+   },
+ 
+   /*
+    * An Adafruit HAT with the PWM modification
+    */
+   {
+-    .name          = "adafruit-hat-pwm",
+-
+-    .output_enable = GPIO_BIT(18),  /* The only change compared to above */
+-    .clock         = GPIO_BIT(17),
+-    .strobe        = GPIO_BIT(21),
+-
+-    .a             = GPIO_BIT(22),
+-    .b             = GPIO_BIT(26),
+-    .c             = GPIO_BIT(27),
+-    .d             = GPIO_BIT(20),
+-    .e             = GPIO_BIT(24),
+-
+-    .p0_r1         = GPIO_BIT(5),
+-    .p0_g1         = GPIO_BIT(13),
+-    .p0_b1         = GPIO_BIT(6),
+-    .p0_r2         = GPIO_BIT(12),
+-    .p0_g2         = GPIO_BIT(16),
+-    .p0_b2         = GPIO_BIT(23),
++    .name            = "adafruit-hat-pwm",
++
++    .output_enable   = GPIO_BIT(18),  /* The only change compared to above */
++    .output_polarity = GPIO_ACTIVE_LOW,
++    .clock           = GPIO_BIT(17),
++    .strobe          = GPIO_BIT(21),
++
++    .a               = GPIO_BIT(22),
++    .b               = GPIO_BIT(26),
++    .c               = GPIO_BIT(27),
++    .d               = GPIO_BIT(20),
++    .e               = GPIO_BIT(24),
++
++    .p0_r1           = GPIO_BIT(5),
++    .p0_g1           = GPIO_BIT(13),
++    .p0_b1           = GPIO_BIT(6),
++    .p0_r2           = GPIO_BIT(12),
++    .p0_g2           = GPIO_BIT(16),
++    .p0_b2           = GPIO_BIT(23),
+   },
+ 
+   /*
+@@ -119,29 +122,30 @@ struct HardwareMapping matrix_hardware_mappings[] = {
+    * the same pin for GPIO-21 as later Pis use GPIO-27. Make it work for both.
+    */
+   {
+-    .name          = "regular-pi1",
++    .name            = "regular-pi1",
+ 
+-    .output_enable = GPIO_BIT(18),
+-    .clock         = GPIO_BIT(17),
+-    .strobe        = GPIO_BIT(4),
++    .output_enable   = GPIO_BIT(18),
++    .output_polarity = GPIO_ACTIVE_LOW,
++    .clock           = GPIO_BIT(17),
++    .strobe          = GPIO_BIT(4),
+ 
+     /* Address lines */
+-    .a             = GPIO_BIT(22),
+-    .b             = GPIO_BIT(23),
+-    .c             = GPIO_BIT(24),
+-    .d             = GPIO_BIT(25),
+-    .e             = GPIO_BIT(15),  /* RxD kept free unless 1:64 */
++    .a               = GPIO_BIT(22),
++    .b               = GPIO_BIT(23),
++    .c               = GPIO_BIT(24),
++    .d               = GPIO_BIT(25),
++    .e               = GPIO_BIT(15),  /* RxD kept free unless 1:64 */
+ 
+     /* Parallel chain 0, RGB for both sub-panels */
+-    .p0_r1         = GPIO_BIT(11),  /* masks: SPI0_SCKL  */
++    .p0_r1           = GPIO_BIT(11),  /* masks: SPI0_SCKL  */
+     /* On Pi1 Rev1, the pin other Pis have GPIO27, these have GPIO21. So make
+      * this work for both Rev1 and Rev2.
+      */
+-    .p0_g1         = GPIO_BIT(21) | GPIO_BIT(27),
+-    .p0_b1         = GPIO_BIT(7),   /* masks: SPI0_CE1   */
+-    .p0_r2         = GPIO_BIT(8),   /* masks: SPI0_CE0   */
+-    .p0_g2         = GPIO_BIT(9),   /* masks: SPI0_MISO  */
+-    .p0_b2         = GPIO_BIT(10),  /* masks: SPI0_MOSI  */
++    .p0_g1           = GPIO_BIT(21) | GPIO_BIT(27),
++    .p0_b1           = GPIO_BIT(7),   /* masks: SPI0_CE1   */
++    .p0_r2           = GPIO_BIT(8),   /* masks: SPI0_CE0   */
++    .p0_g2           = GPIO_BIT(9),   /* masks: SPI0_MISO  */
++    .p0_b2           = GPIO_BIT(10),  /* masks: SPI0_MOSI  */
+ 
+     /* No more chains - there are not enough GPIO */
+   },
+@@ -153,64 +157,66 @@ struct HardwareMapping matrix_hardware_mappings[] = {
+    * Not used anymore.
+    */
+   {
+-    .name          = "classic",
+-
+-    .output_enable = GPIO_BIT(27),  /* Not available on RPi1, Rev 1 */
+-    .clock         = GPIO_BIT(11),
+-    .strobe        = GPIO_BIT(4),
+-
+-    .a             = GPIO_BIT(7),
+-    .b             = GPIO_BIT(8),
+-    .c             = GPIO_BIT(9),
+-    .d             = GPIO_BIT(10),
+-
+-    .p0_r1         = GPIO_BIT(17),
+-    .p0_g1         = GPIO_BIT(18),
+-    .p0_b1         = GPIO_BIT(22),
+-    .p0_r2         = GPIO_BIT(23),
+-    .p0_g2         = GPIO_BIT(24),
+-    .p0_b2         = GPIO_BIT(25),
+-
+-    .p1_r1         = GPIO_BIT(12),
+-    .p1_g1         = GPIO_BIT(5),
+-    .p1_b1         = GPIO_BIT(6),
+-    .p1_r2         = GPIO_BIT(19),
+-    .p1_g2         = GPIO_BIT(13),
+-    .p1_b2         = GPIO_BIT(20),
+-
+-    .p2_r1         = GPIO_BIT(14),   /* masks TxD if parallel = 3 */
+-    .p2_g1         = GPIO_BIT(2),    /* masks SDA if parallel = 3 */
+-    .p2_b1         = GPIO_BIT(3),    /* masks SCL if parallel = 3 */
+-    .p2_r2         = GPIO_BIT(15),
+-    .p2_g2         = GPIO_BIT(26),
+-    .p2_b2         = GPIO_BIT(21),
++    .name            = "classic",
++
++    .output_enable   = GPIO_BIT(27),  /* Not available on RPi1, Rev 1 */
++    .output_polarity = GPIO_ACTIVE_LOW,
++    .clock           = GPIO_BIT(11),
++    .strobe          = GPIO_BIT(4),
++
++    .a               = GPIO_BIT(7),
++    .b               = GPIO_BIT(8),
++    .c               = GPIO_BIT(9),
++    .d               = GPIO_BIT(10),
++
++    .p0_r1           = GPIO_BIT(17),
++    .p0_g1           = GPIO_BIT(18),
++    .p0_b1           = GPIO_BIT(22),
++    .p0_r2           = GPIO_BIT(23),
++    .p0_g2           = GPIO_BIT(24),
++    .p0_b2           = GPIO_BIT(25),
++
++    .p1_r1           = GPIO_BIT(12),
++    .p1_g1           = GPIO_BIT(5),
++    .p1_b1           = GPIO_BIT(6),
++    .p1_r2           = GPIO_BIT(19),
++    .p1_g2           = GPIO_BIT(13),
++    .p1_b2           = GPIO_BIT(20),
++
++    .p2_r1           = GPIO_BIT(14),   /* masks TxD if parallel = 3 */
++    .p2_g1           = GPIO_BIT(2),    /* masks SDA if parallel = 3 */
++    .p2_b1           = GPIO_BIT(3),    /* masks SCL if parallel = 3 */
++    .p2_r2           = GPIO_BIT(15),
++    .p2_g2           = GPIO_BIT(26),
++    .p2_b2           = GPIO_BIT(21),
+   },
+ 
+   /*
+    * Classic pin-out for Rev-A Raspberry Pi.
+    */
+   {
+-    .name          = "classic-pi1",
++    .name            = "classic-pi1",
+ 
+     /* The Revision-1 and Revision-2 boards have different GPIO mappings
+      * on the P1-3 and P1-5. So we use both interpretations.
+      * To keep the I2C pins free, we avoid these in later mappings.
+      */
+-    .output_enable = GPIO_BIT(0) | GPIO_BIT(2),
+-    .clock         = GPIO_BIT(1) | GPIO_BIT(3),
+-    .strobe        = GPIO_BIT(4),
+-
+-    .a             = GPIO_BIT(7),
+-    .b             = GPIO_BIT(8),
+-    .c             = GPIO_BIT(9),
+-    .d             = GPIO_BIT(10),
+-
+-    .p0_r1         = GPIO_BIT(17),
+-    .p0_g1         = GPIO_BIT(18),
+-    .p0_b1         = GPIO_BIT(22),
+-    .p0_r2         = GPIO_BIT(23),
+-    .p0_g2         = GPIO_BIT(24),
+-    .p0_b2         = GPIO_BIT(25),
++    .output_enable   = GPIO_BIT(0) | GPIO_BIT(2),
++    .output_polarity = GPIO_ACTIVE_LOW,
++    .clock           = GPIO_BIT(1) | GPIO_BIT(3),
++    .strobe          = GPIO_BIT(4),
++
++    .a               = GPIO_BIT(7),
++    .b               = GPIO_BIT(8),
++    .c               = GPIO_BIT(9),
++    .d               = GPIO_BIT(10),
++
++    .p0_r1           = GPIO_BIT(17),
++    .p0_g1           = GPIO_BIT(18),
++    .p0_b1           = GPIO_BIT(22),
++    .p0_r2           = GPIO_BIT(23),
++    .p0_g2           = GPIO_BIT(24),
++    .p0_b2           = GPIO_BIT(25),
+   },
+ 
+ #ifdef ENABLE_WIDE_GPIO_COMPUTE_MODULE
+@@ -218,68 +224,69 @@ struct HardwareMapping matrix_hardware_mappings[] = {
+    * Custom pin-out for compute-module
+    */
+   {
+-    .name          = "compute-module",
++    .name            = "compute-module",
+ 
+     /* This GPIO mapping is made for the official I/O development
+      * board. No pin is left free when using 6 parallel chains.
+      */
+-    .output_enable = GPIO_BIT(18),
+-    .clock         = GPIO_BIT(16),
+-    .strobe        = GPIO_BIT(17),
++    .output_enable   = GPIO_BIT(18),
++    .output_polarity = GPIO_ACTIVE_LOW,
++    .clock           = GPIO_BIT(16),
++    .strobe          = GPIO_BIT(17),
+ 
+-    .a             = GPIO_BIT(2),
+-    .b             = GPIO_BIT(3),
+-    .c             = GPIO_BIT(4),
+-    .d             = GPIO_BIT(5),
+-    .e             = GPIO_BIT(6),  /* RxD kept free unless 1:64 */
++    .a               = GPIO_BIT(2),
++    .b               = GPIO_BIT(3),
++    .c               = GPIO_BIT(4),
++    .d               = GPIO_BIT(5),
++    .e               = GPIO_BIT(6),  /* RxD kept free unless 1:64 */
+ 
+     /* Chain 0 */
+-    .p0_r1         = GPIO_BIT(7),
+-    .p0_g1         = GPIO_BIT(8),
+-    .p0_b1         = GPIO_BIT(9),
+-    .p0_r2         = GPIO_BIT(10),
+-    .p0_g2         = GPIO_BIT(11),
+-    .p0_b2         = GPIO_BIT(12),
++    .p0_r1           = GPIO_BIT(7),
++    .p0_g1           = GPIO_BIT(8),
++    .p0_b1           = GPIO_BIT(9),
++    .p0_r2           = GPIO_BIT(10),
++    .p0_g2           = GPIO_BIT(11),
++    .p0_b2           = GPIO_BIT(12),
+ 
+     /* Chain 1 */
+-    .p1_r1         = GPIO_BIT(13),
+-    .p1_g1         = GPIO_BIT(14),
+-    .p1_b1         = GPIO_BIT(15),
+-    .p1_r2         = GPIO_BIT(19),
+-    .p1_g2         = GPIO_BIT(20),
+-    .p1_b2         = GPIO_BIT(21),
++    .p1_r1           = GPIO_BIT(13),
++    .p1_g1           = GPIO_BIT(14),
++    .p1_b1           = GPIO_BIT(15),
++    .p1_r2           = GPIO_BIT(19),
++    .p1_g2           = GPIO_BIT(20),
++    .p1_b2           = GPIO_BIT(21),
+ 
+     /* Chain 2 */
+-    .p2_r1         = GPIO_BIT(22),
+-    .p2_g1         = GPIO_BIT(23),
+-    .p2_b1         = GPIO_BIT(24),
+-    .p2_r2         = GPIO_BIT(25),
+-    .p2_g2         = GPIO_BIT(26),
+-    .p2_b2         = GPIO_BIT(27),
++    .p2_r1           = GPIO_BIT(22),
++    .p2_g1           = GPIO_BIT(23),
++    .p2_b1           = GPIO_BIT(24),
++    .p2_r2           = GPIO_BIT(25),
++    .p2_g2           = GPIO_BIT(26),
++    .p2_b2           = GPIO_BIT(27),
+ 
+     /* Chain 3 */
+-    .p3_r1         = GPIO_BIT(28),
+-    .p3_g1         = GPIO_BIT(29),
+-    .p3_b1         = GPIO_BIT(30),
+-    .p3_r2         = GPIO_BIT(31),
+-    .p3_g2         = GPIO_BIT(32),
+-    .p3_b2         = GPIO_BIT(33),
++    .p3_r1           = GPIO_BIT(28),
++    .p3_g1           = GPIO_BIT(29),
++    .p3_b1           = GPIO_BIT(30),
++    .p3_r2           = GPIO_BIT(31),
++    .p3_g2           = GPIO_BIT(32),
++    .p3_b2           = GPIO_BIT(33),
+ 
+     /* Chain 4 */
+-    .p4_r1         = GPIO_BIT(34),
+-    .p4_g1         = GPIO_BIT(35),
+-    .p4_b1         = GPIO_BIT(36),
+-    .p4_r2         = GPIO_BIT(37),
+-    .p4_g2         = GPIO_BIT(38),
+-    .p4_b2         = GPIO_BIT(39),
++    .p4_r1           = GPIO_BIT(34),
++    .p4_g1           = GPIO_BIT(35),
++    .p4_b1           = GPIO_BIT(36),
++    .p4_r2           = GPIO_BIT(37),
++    .p4_g2           = GPIO_BIT(38),
++    .p4_b2           = GPIO_BIT(39),
+ 
+     /* Chain 5 */
+-    .p5_r1         = GPIO_BIT(40),
+-    .p5_g1         = GPIO_BIT(41),
+-    .p5_b1         = GPIO_BIT(42),
+-    .p5_r2         = GPIO_BIT(43),
+-    .p5_g2         = GPIO_BIT(44),
+-    .p5_b2         = GPIO_BIT(45),
++    .p5_r1           = GPIO_BIT(40),
++    .p5_g1           = GPIO_BIT(41),
++    .p5_b1           = GPIO_BIT(42),
++    .p5_r2           = GPIO_BIT(43),
++    .p5_g2           = GPIO_BIT(44),
++    .p5_b2           = GPIO_BIT(45),
+   },
+ #endif
+ 
+diff --git a/lib/hardware-mapping.h b/lib/hardware-mapping.h
+index df4b440..7a3760d 100644
+--- a/lib/hardware-mapping.h
++++ b/lib/hardware-mapping.h
+@@ -27,6 +27,7 @@ struct HardwareMapping {
+   int max_parallel_chains;
+ 
+   gpio_bits_t output_enable;
++  gpio_active_t output_polarity;
+   gpio_bits_t clock;
+   gpio_bits_t strobe;
+ 
+-- 
+2.33.1
+
