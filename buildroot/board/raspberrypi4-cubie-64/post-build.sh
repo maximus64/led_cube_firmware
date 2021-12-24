@@ -5,12 +5,14 @@ set -e
 
 BOARD_DIR="$(dirname $0)"
 
-# Add a console on tty1
-if [ -e ${TARGET_DIR}/etc/inittab ]; then
-    grep -qE '^tty1::' ${TARGET_DIR}/etc/inittab || \
-	sed -i '/GENERIC_SERIAL/a\
-tty1::respawn:/sbin/getty -L  tty1 0 vt100 # HDMI console' ${TARGET_DIR}/etc/inittab
+# mount /nvram
+mkdir -p ${TARGET_DIR}/nvram
+if [ -e ${TARGET_DIR}/etc/fstab ]; then
+    grep -qE '^/dev/mmcblk0p3' ${TARGET_DIR}/etc/fstab || \
+    echo "/dev/mmcblk0p3		/nvram		vfat	rw,noatime,discard	0	0" >> ${TARGET_DIR}/etc/fstab
 fi
+# change root mount options
+sed -i "s/\/dev\/root.*/\/dev\/root       \/               ext4    rw,noauto,noatime,discard       0       1/g" ${TARGET_DIR}/etc/fstab
 
 install -m 0644 -D ${BOARD_DIR}/config.txt ${BINARIES_DIR}/rpi-firmware/config.txt
 install -m 0644 -D ${BOARD_DIR}/cmdline.txt ${BINARIES_DIR}/rpi-firmware/cmdline.txt
